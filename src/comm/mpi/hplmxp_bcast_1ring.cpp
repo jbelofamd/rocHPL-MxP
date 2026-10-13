@@ -15,6 +15,33 @@
  */
 
 #include "hplmxp_comm_mpi.hpp"
+#include <cstdlib>
+#include <vector>
+
+/* Pipelined ring: up to ring_depth() chunks of ring_chunk_bytes() each are
+ * in flight on both the receive and the send side, so a hop's wire time is
+ * not serialized behind one chunk's rendezvous round trip.
+ *   HPLMXP_RING_DEPTH     chunks in flight per direction (1..16, default 1,
+ *                         the original one-recv/one-send ring; 4 is a good
+ *                         starting point when pipelining)
+ *   HPLMXP_RING_CHUNK_KB  chunk size in KiB (default 2048) */
+static int ring_env(const char* name, int dflt, int lo, int hi) {
+  const char* v = std::getenv(name);
+  if(v == nullptr || *v == '\0') return dflt;
+  int x = std::atoi(v);
+  return std::max(lo, std::min(hi, x));
+}
+
+static int ring_depth() {
+  static const int depth = ring_env("HPLMXP_RING_DEPTH", 1, 1, 16);
+  return depth;
+}
+
+static size_t ring_chunk_bytes() {
+  static const size_t bytes =
+      size_t(ring_env("HPLMXP_RING_CHUNK_KB", 2048, 4, 1 << 20)) << 10;
+  return bytes;
+}
 
 template <typename T>
 int HPLMXP_bcast_1ring(T* SBUF, int SCOUNT, int ROOT, MPI_Comm COMM) {
@@ -23,80 +50,79 @@ int HPLMXP_bcast_1ring(T* SBUF, int SCOUNT, int ROOT, MPI_Comm COMM) {
   MPI_Comm_rank(COMM, &rank);
   MPI_Comm_size(COMM, &size);
 
-  if(size <= 1) return (MPI_SUCCESS);
+  if(size <= 1 || SCOUNT <= 0) return (MPI_SUCCESS);
 
   /*One ring exchange to rule them all*/
-  int chunk_size = (1 << 21) / sizeof(T); // 2MB
-  // int chunk_size = (1<<18)/sizeof(T); // 256KB
-
-  chunk_size = std::min(chunk_size, SCOUNT);
-
-  MPI_Request request[2];
-
-  request[0] = MPI_REQUEST_NULL;
-  request[1] = MPI_REQUEST_NULL;
-
+  const int chunk_size =
+      int(std::min<size_t>(ring_chunk_bytes() / sizeof(T), size_t(SCOUNT)));
   const int Nchunks = (SCOUNT + chunk_size - 1) / chunk_size;
+  const int depth   = std::min(ring_depth(), Nchunks);
 
   const int tag  = rank;
   const int next = MModAdd1(rank, size);
   const int prev = MModSub1(rank, size);
 
-  /*Mid point of message*/
-  T* RBUF = SBUF;
-
   /*Shift to ROOT=0*/
   rank = MModSub(rank, ROOT, size);
 
-  int Nsend = (rank == size - 1) ? 0 : SCOUNT;
-  int Nrecv = (rank == 0) ? 0 : SCOUNT;
+  const bool do_recv = (rank != 0);
+  const bool do_send = (rank != size - 1);
 
-  /*Recv from left*/
-  int Nr = std::min(Nrecv, chunk_size);
-  if(Nr > 0) {
-    MPI_Irecv(RBUF, Nr, T2MPI<T>::type, prev, prev, COMM, request + 0);
-  }
+  /* request[0..depth) are receives, request[depth..2*depth) sends; chunk c
+   * uses slot c % depth on either side. Sends are posted strictly in chunk
+   * order so that they match the receiver's in-order posted receives. */
+  std::vector<MPI_Request> request(2 * depth, MPI_REQUEST_NULL);
+  std::vector<int>         slot_chunk(depth, -1);
+  std::vector<int>         done_idx(2 * depth);
+  std::vector<char>        have(Nchunks, do_recv ? 0 : 1);
 
-  /*Send to right if there is data present to send*/
-  int Ns = std::min(Nsend - Nrecv, chunk_size);
-  if(Ns > 0) {
-    MPI_Isend(SBUF, Ns, T2MPI<T>::type, next, tag, COMM, request + 1);
-  }
+  auto chunk_ptr = [&](int c) { return SBUF + size_t(c) * chunk_size; };
+  auto chunk_len = [&](int c) {
+    return std::min(chunk_size, SCOUNT - c * chunk_size);
+  };
 
-  while(Nsend > 0 || Nrecv > 0) {
-    int index = -1;
-    MPI_Waitany(2, request, &index, MPI_STATUSES_IGNORE);
+  int nrecv_posted = do_recv ? 0 : Nchunks;
+  int nsend_posted = do_send ? 0 : Nchunks;
 
-    if(index == 0) { /*Recv'd from left*/
-      /*If we're waiting on this recv in order to send, send now*/
-      if(Nrecv == Nsend) {
-        Ns = Nr;
-        MPI_Isend(SBUF, Ns, T2MPI<T>::type, next, tag, COMM, request + 1);
-      }
+  while(true) {
+    /*Recv from left into every free slot*/
+    while(nrecv_posted < Nchunks &&
+          request[nrecv_posted % depth] == MPI_REQUEST_NULL) {
+      const int c           = nrecv_posted++;
+      slot_chunk[c % depth] = c;
+      MPI_Irecv(chunk_ptr(c),
+                chunk_len(c),
+                T2MPI<T>::type,
+                prev,
+                prev,
+                COMM,
+                &request[c % depth]);
+    }
 
-      /*Count the recv'd amounts*/
-      Nrecv -= Nr;
-      RBUF += Nr;
+    /*Send to right, in order, every chunk that is present*/
+    while(nsend_posted < Nchunks && have[nsend_posted] &&
+          request[depth + nsend_posted % depth] == MPI_REQUEST_NULL) {
+      const int c = nsend_posted++;
+      MPI_Isend(chunk_ptr(c),
+                chunk_len(c),
+                T2MPI<T>::type,
+                next,
+                tag,
+                COMM,
+                &request[depth + c % depth]);
+    }
 
-      /*Post next recv if needed*/
-      Nr = std::min(Nrecv, chunk_size);
-      if(Nr > 0) {
-        MPI_Irecv(RBUF, Nr, T2MPI<T>::type, prev, prev, COMM, request + 0);
-      } else {
-        request[0] = MPI_REQUEST_NULL;
-      }
+    int ndone = 0;
+    MPI_Waitsome(2 * depth,
+                 request.data(),
+                 &ndone,
+                 done_idx.data(),
+                 MPI_STATUSES_IGNORE);
+    if(ndone == MPI_UNDEFINED) break; /*nothing left in flight*/
 
-    } else if(index == 1) { /*Sent to right */
-      Nsend -= Ns;
-      SBUF += Ns;
-
-      /*Send to right if there is data present to send*/
-      Ns = std::min(Nsend - Nrecv, chunk_size);
-      if(Ns > 0) {
-        MPI_Isend(SBUF, Ns, T2MPI<T>::type, next, tag, COMM, request + 1);
-      } else {
-        request[1] = MPI_REQUEST_NULL;
-      }
+    for(int i = 0; i < ndone; ++i) {
+      const int idx = done_idx[i];
+      if(idx < depth) have[slot_chunk[idx]] = 1;
     }
   }
 

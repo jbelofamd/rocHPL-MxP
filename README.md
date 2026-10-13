@@ -91,6 +91,8 @@ srun -N 2 -n 16 run_rochplmxp -P 4 -Q 4 -p 4 -q 2 -N 128000 --NB 512
 ```
 This helps to control where/how much inter-node communication is occuring. 
 
+With the MPI backend, the default `1ring` panel broadcast can keep several chunks in flight per hop instead of one. This is opt-in: set `HPLMXP_RING_DEPTH` (1-16, default 1, the classic one-chunk ring; 4 is a good starting point) and optionally `HPLMXP_RING_CHUNK_KB` (chunk size, default 2048).
+
 ## RCCL communication backend
 All communication in rocHPL-MxP goes through one interface, `include/hplmxp_comm.hpp`, with two implementations selected when configuring:
 ```
